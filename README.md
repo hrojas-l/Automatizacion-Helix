@@ -7,9 +7,9 @@ API que automatiza la creación, modificación y eliminación de Virtual Servers
 Recibe solicitudes desde **Helix** y automáticamente configura balanceadores de carga **F5** sin intervención manual.
 
 ### Operaciones soportadas:
-- ✅ **CREAR** nuevo Virtual Server con pool de servidores
-- ✏️ **MODIFICAR** configuración existente (IPs, puertos, servidores)
-- ❌ **ELIMINAR** aplicaciones del F5
+-  **CREAR** nuevo Virtual Server con pool de servidores
+-  **MODIFICAR** configuración existente (IPs, puertos, servidores)
+-  **ELIMINAR** aplicaciones del F5
 
 ---
 
