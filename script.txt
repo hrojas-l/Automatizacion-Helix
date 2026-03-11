@@ -1,0 +1,552 @@
+#!/bin/bash
+################################################################################
+# F5 Pool & Virtual Server Manager
+# Acciones: create | edit | delete
+################################################################################
+set -euo pipefail
+
+# ============================================================================
+# CREDENCIALES F5
+# ============================================================================
+read_credentials() {
+    echo "========================================="
+    echo "  CREDENCIALES F5"
+    echo "========================================="
+    read -p "F5 Hostname o IP: " F5_HOST
+    read -p "Usuario F5: "       F5_USER
+    read -s -p "Password F5: "   F5_PASS
+    echo ""
+    export F5_HOST F5_USER F5_PASS
+}
+
+# ============================================================================
+# FUNCIONES DE VERIFICACIÓN
+# ============================================================================
+vlan_exists() {
+    local response=$(curl -sk -u "$F5_USER:$F5_PASS" \
+      -H "Content-Type: application/json" -X GET \
+      "https://$F5_HOST/mgmt/tm/net/vlan/$1" 2>/dev/null)
+    echo "$response" | jq -e '.name' >/dev/null 2>&1
+}
+
+pool_exists() {
+    local response=$(curl -sk -u "$F5_USER:$F5_PASS" \
+      -H "Content-Type: application/json" -X GET \
+      "https://$F5_HOST/mgmt/tm/ltm/pool/$1" 2>/dev/null)
+    echo "$response" | jq -e '.name' >/dev/null 2>&1
+}
+
+vs_exists() {
+    local response=$(curl -sk -u "$F5_USER:$F5_PASS" \
+      -H "Content-Type: application/json" -X GET \
+      "https://$F5_HOST/mgmt/tm/ltm/virtual/$1" 2>/dev/null)
+    echo "$response" | jq -e '.name' >/dev/null 2>&1
+}
+
+monitor_exists() {
+    local response=$(curl -sk -u "$F5_USER:$F5_PASS" \
+      -H "Content-Type: application/json" -X GET \
+      "https://$F5_HOST/mgmt/tm/ltm/monitor/tcp/$1" 2>/dev/null)
+    echo "$response" | jq -e '.name' >/dev/null 2>&1
+}
+
+member_exists() {
+    local pool_name="$1"
+    local member="$2"
+    local response=$(curl -sk -u "$F5_USER:$F5_PASS" \
+      -H "Content-Type: application/json" -X GET \
+      "https://$F5_HOST/mgmt/tm/ltm/pool/$pool_name/members/$member" \
+      2>/dev/null)
+    echo "$response" | jq -e '.name' >/dev/null 2>&1
+}
+
+# ============================================================================
+# LISTAR VLANS
+# ============================================================================
+list_vlans() {
+    echo "[LISTADO] VLANs disponibles:" >&2
+    curl -sk -u "$F5_USER:$F5_PASS" \
+      -H "Content-Type: application/json" -X GET \
+      "https://$F5_HOST/mgmt/tm/net/vlan" 2>/dev/null \
+      | jq -r '.items[]?.name // empty' 2>/dev/null \
+      | while read v; do echo "   - $v" >&2; done
+}
+
+# ============================================================================
+# FORMATEAR MIEMBROS
+# ============================================================================
+format_members() {
+    jq '[.[] | {
+        name: (.ip + ":" + (.port|tostring)),
+        address: .ip,
+        port: .port
+    }]'
+}
+
+# ============================================================================
+# PARÁMETROS CREATE
+# ============================================================================
+read_dynamic_params() {
+    echo ""
+    echo "========================================="
+    echo "  PARÁMETROS DE CONFIGURACIÓN"
+    echo "========================================="
+
+    while true; do
+        read -p "Nombre del Pool: " POOL_NAME
+        [[ -z "$POOL_NAME" ]] && echo "[ERROR] Nombre vacío" && continue
+        if pool_exists "$POOL_NAME"; then
+            echo "[ADVERTENCIA] Pool '$POOL_NAME' ya existe"
+        else
+            echo "[OK] Nombre disponible"; break
+        fi
+    done
+
+    while true; do
+        read -p "VLAN (ENTER para omitir): " VLAN_NAME
+        [[ -z "$VLAN_NAME" ]] && echo "[OK] Sin restricción de VLAN" && break
+        if vlan_exists "$VLAN_NAME"; then
+            echo "[OK] VLAN validada"; break
+        else
+            echo "[ERROR] VLAN '$VLAN_NAME' no existe"
+            list_vlans
+        fi
+    done
+
+    export POOL_NAME VLAN_NAME
+}
+
+# ============================================================================
+# CREAR MONITOR TCP
+# ============================================================================
+create_tcp_monitor() {
+    local monitor_name="tcp_monitor_${POOL_NAME}"
+    if monitor_exists "$monitor_name"; then
+        echo "[INFO] Monitor '$monitor_name' existe, se reutilizará" >&2
+        echo "$monitor_name"; return 0
+    fi
+    echo "[CREANDO] Monitor TCP: $monitor_name" >&2
+    local payload=$(jq -n --arg name "$monitor_name" \
+      '{name:$name, interval:5, timeout:16}')
+    local response=$(curl -sk -u "$F5_USER:$F5_PASS" \
+      -H "Content-Type: application/json" -X POST -d "$payload" \
+      "https://$F5_HOST/mgmt/tm/ltm/monitor/tcp" 2>&1)
+    if echo "$response" | jq -e '.name' >/dev/null 2>&1; then
+        echo "[OK] Monitor creado" >&2
+    else
+        echo "[ADVERTENCIA] Posible error al crear monitor" >&2
+    fi
+    echo "$monitor_name"
+}
+
+# ============================================================================
+# ELIMINACIÓN DE MIEMBRO ESPECÍFICO
+# ============================================================================
+delete_member() {
+    local pool_name="$1"
+    local member="$2"
+
+    echo ""
+    echo "========================================="
+    echo "  ELIMINAR MIEMBRO: $member del pool $pool_name"
+    echo "========================================="
+
+    if ! pool_exists "$pool_name"; then
+        echo "[ERROR] Pool '$pool_name' no existe"
+        return 1
+    fi
+
+    if ! member_exists "$pool_name" "$member"; then
+        echo "[ERROR] Miembro '$member' no existe en el pool '$pool_name'"
+        return 1
+    fi
+
+    echo "[INFO] Miembro encontrado en pool '$pool_name'"
+    echo ""
+    read -p "¿Confirmas eliminar el miembro '$member'? [y/N]: " confirm
+    [[ ! "$confirm" =~ ^[Yy]$ ]] && echo "[INFO] Operación cancelada" && return 0
+
+    echo "[ELIMINANDO] Eliminando miembro $member..."
+    local response=$(curl -sk -u "$F5_USER:$F5_PASS" \
+      -H "Content-Type: application/json" -X DELETE \
+      "https://$F5_HOST/mgmt/tm/ltm/pool/$pool_name/members/$member" \
+      2>&1)
+
+    # DELETE exitoso retorna 200 con body vacío
+    if [[ -z "$response" ]] || echo "$response" | jq -e 'if . == {} then true
+      elif .name then true else false end' >/dev/null 2>&1; then
+        echo "[OK] Miembro '$member' eliminado del pool '$pool_name'"
+    else
+        echo "[ERROR] Error al eliminar miembro:"
+        echo "$response" | jq -r '.message // .' 2>/dev/null || echo "$response"
+        return 1
+    fi
+}
+
+# ============================================================================
+# ELIMINACIÓN DE VIRTUAL SERVER
+# ============================================================================
+delete_virtual_server() {
+    local vs_name="$1"
+
+    echo ""
+    echo "========================================="
+    echo "  ELIMINAR VIRTUAL SERVER: $vs_name"
+    echo "========================================="
+
+    if ! vs_exists "$vs_name"; then
+        echo "[ERROR] VS '$vs_name' no existe en F5"
+        return 1
+    fi
+
+    # Mostrar info del VS antes de eliminar
+    echo "[INFO] Datos del VS a eliminar:"
+    curl -sk -u "$F5_USER:$F5_PASS" \
+      -H "Content-Type: application/json" -X GET \
+      "https://$F5_HOST/mgmt/tm/ltm/virtual/$vs_name" \
+      | jq '{name, destination, pool, vlans, enabled}'
+
+    echo ""
+    read -p "¿Confirmas eliminar el VS '$vs_name'? [y/N]: " confirm
+    [[ ! "$confirm" =~ ^[Yy]$ ]] && echo "[INFO] Operación cancelada" && return 0
+
+    echo "[ELIMINANDO] Eliminando VS $vs_name..."
+    local response=$(curl -sk -u "$F5_USER:$F5_PASS" \
+      -H "Content-Type: application/json" -X DELETE \
+      "https://$F5_HOST/mgmt/tm/ltm/virtual/$vs_name" 2>&1)
+
+    if [[ -z "$response" ]] || echo "$response" | jq -e 'if . == {} then true
+      elif .name then true else false end' >/dev/null 2>&1; then
+        echo "[OK] VS '$vs_name' eliminado exitosamente"
+    else
+        echo "[ERROR] Error al eliminar VS:"
+        echo "$response" | jq -r '.message // .' 2>/dev/null || echo "$response"
+        return 1
+    fi
+}
+
+# ============================================================================
+# ELIMINACIÓN DE POOL
+# ============================================================================
+delete_pool() {
+    local pool_name="$1"
+
+    echo ""
+    echo "========================================="
+    echo "  ELIMINAR POOL: $pool_name"
+    echo "========================================="
+
+    if ! pool_exists "$pool_name"; then
+        echo "[ERROR] Pool '$pool_name' no existe en F5"
+        return 1
+    fi
+
+    # Mostrar miembros antes de eliminar
+    echo "[INFO] Miembros del pool a eliminar:"
+    curl -sk -u "$F5_USER:$F5_PASS" \
+      -H "Content-Type: application/json" -X GET \
+      "https://$F5_HOST/mgmt/tm/ltm/pool/$pool_name/members" \
+      | jq '.items[]? | {name, address, port, session, state}'
+
+    echo ""
+    read -p "¿Confirmas eliminar el pool '$pool_name' y todos sus miembros? [y/N]: " confirm
+    [[ ! "$confirm" =~ ^[Yy]$ ]] && echo "[INFO] Operación cancelada" && return 0
+
+    echo "[ELIMINANDO] Eliminando pool $pool_name..."
+    local response=$(curl -sk -u "$F5_USER:$F5_PASS" \
+      -H "Content-Type: application/json" -X DELETE \
+      "https://$F5_HOST/mgmt/tm/ltm/pool/$pool_name" 2>&1)
+
+    if [[ -z "$response" ]] || echo "$response" | jq -e 'if . == {} then true
+      elif .name then true else false end' >/dev/null 2>&1; then
+        echo "[OK] Pool '$pool_name' eliminado exitosamente"
+    else
+        echo "[ERROR] Error al eliminar pool:"
+        echo "$response" | jq -r '.message // .' 2>/dev/null || echo "$response"
+
+        if echo "$response" | grep -qi "still in use\|reference"; then
+            echo ""
+            echo "[ADVERTENCIA] El pool aún está siendo usado por un VS."
+            echo "   Elimina primero el VS asociado antes de eliminar el pool."
+        fi
+        return 1
+    fi
+}
+
+# ============================================================================
+# ELIMINACIÓN DE MONITOR TCP
+# ============================================================================
+delete_monitor() {
+    local monitor_name="$1"
+
+    echo ""
+    echo "========================================="
+    echo "  ELIMINAR MONITOR: $monitor_name"
+    echo "========================================="
+
+    if ! monitor_exists "$monitor_name"; then
+        echo "[ERROR] Monitor '$monitor_name' no existe en F5"
+        return 1
+    fi
+
+    echo "[INFO] Datos del monitor a eliminar:"
+    curl -sk -u "$F5_USER:$F5_PASS" \
+      -H "Content-Type: application/json" -X GET \
+      "https://$F5_HOST/mgmt/tm/ltm/monitor/tcp/$monitor_name" \
+      | jq '{name, interval, timeout}'
+
+    echo ""
+    read -p "¿Confirmas eliminar el monitor '$monitor_name'? [y/N]: " confirm
+    [[ ! "$confirm" =~ ^[Yy]$ ]] && echo "[INFO] Operación cancelada" && return 0
+
+    echo "[ELIMINANDO] Eliminando monitor $monitor_name..."
+    local response=$(curl -sk -u "$F5_USER:$F5_PASS" \
+      -H "Content-Type: application/json" -X DELETE \
+      "https://$F5_HOST/mgmt/tm/ltm/monitor/tcp/$monitor_name" 2>&1)
+
+    if [[ -z "$response" ]] || echo "$response" | jq -e 'if . == {} then true
+      elif .name then true else false end' >/dev/null 2>&1; then
+        echo "[OK] Monitor '$monitor_name' eliminado exitosamente"
+    else
+        echo "[ERROR] Error al eliminar monitor:"
+        echo "$response" | jq -r '.message // .' 2>/dev/null || echo "$response"
+
+        if echo "$response" | grep -qi "still in use\|reference"; then
+            echo ""
+            echo "[ADVERTENCIA] El monitor aún está siendo usado por un pool."
+            echo "   Elimina primero el pool asociado antes de eliminar el monitor."
+        fi
+        return 1
+    fi
+}
+
+# ============================================================================
+# FLUJO COMPLETO DE ELIMINACIÓN
+# ============================================================================
+run_delete() {
+    local file="${2:-}"
+
+    echo ""
+    echo "========================================="
+    echo "  ¿QUÉ DESEAS ELIMINAR?"
+    echo "========================================="
+    echo "  1) Conjunto completo  (VS + Pool + Monitor)"
+    echo "  2) Solo Virtual Server"
+    echo "  3) Solo Pool completo"
+    echo "  4) Solo un miembro del pool"
+    echo "  5) Solo Monitor TCP"
+    echo ""
+    read -p "Selecciona una opción [1-5]: " delete_option
+
+    # Resolver nombres desde JSON o interactivo
+    local vs_name="" pool_name="" monitor_name="" member=""
+
+    if [[ -n "$file" ]]; then
+        vs_name=$(     jq -r '.vs_name   // empty' "$file")
+        pool_name=$(   jq -r '.pool_name // empty' "$file")
+        monitor_name=$(jq -r '.monitor_name // empty' "$file")
+    fi
+
+    case "$delete_option" in
+        1)
+            # Eliminación completa — orden obligatorio: VS → Pool → Monitor
+            [[ -z "$vs_name"      ]] && read -p "Nombre del VS a eliminar: "      vs_name
+            [[ -z "$pool_name"    ]] && read -p "Nombre del Pool a eliminar: "    pool_name
+            [[ -z "$monitor_name" ]] && monitor_name="tcp_monitor_${pool_name}"
+
+            echo ""
+            echo "[LISTADO] RESUMEN DE ELIMINACIÓN:"
+            echo "   • Virtual Server : $vs_name"
+            echo "   • Pool           : $pool_name"
+            echo "   • Monitor TCP    : $monitor_name"
+            echo ""
+            read -p "¿Confirmas eliminar los 3 recursos? Esta acción no se puede deshacer [y/N]: " confirm
+            [[ ! "$confirm" =~ ^[Yy]$ ]] && echo "[INFO] Operación cancelada" && return 0
+
+            echo ""
+            echo "========================================="
+            echo "  PASO 1: ELIMINAR VIRTUAL SERVER"
+            echo "========================================="
+            if vs_exists "$vs_name"; then
+                echo "[ELIMINANDO] VS $vs_name..."
+                local r1=$(curl -sk -u "$F5_USER:$F5_PASS" \
+                  -H "Content-Type: application/json" -X DELETE \
+                  "https://$F5_HOST/mgmt/tm/ltm/virtual/$vs_name" 2>&1)
+                if [[ -z "$r1" ]] || ! echo "$r1" | jq -e '.message' \
+                  >/dev/null 2>&1; then
+                    echo "[OK] VS eliminado"
+                else
+                    echo "[ERROR] No se pudo eliminar el VS:"
+                    echo "$r1" | jq -r '.message // .' 2>/dev/null
+                    echo "[DETENIDO] Proceso detenido por seguridad"
+                    return 1
+                fi
+            else
+                echo "[INFO] VS '$vs_name' no existe, se omite"
+            fi
+
+            echo ""
+            echo "========================================="
+            echo "  PASO 2: ELIMINAR POOL"
+            echo "========================================="
+            if pool_exists "$pool_name"; then
+                echo "[ELIMINANDO] Pool $pool_name..."
+                local r2=$(curl -sk -u "$F5_USER:$F5_PASS" \
+                  -H "Content-Type: application/json" -X DELETE \
+                  "https://$F5_HOST/mgmt/tm/ltm/pool/$pool_name" 2>&1)
+                if [[ -z "$r2" ]] || ! echo "$r2" | jq -e '.message' \
+                  >/dev/null 2>&1; then
+                    echo "[OK] Pool eliminado"
+                else
+                    echo "[ERROR] No se pudo eliminar el pool:"
+                    echo "$r2" | jq -r '.message // .' 2>/dev/null
+                    echo "[DETENIDO] Proceso detenido. El VS fue eliminado pero el pool no."
+                    return 1
+                fi
+            else
+                echo "[INFO] Pool '$pool_name' no existe, se omite"
+            fi
+
+            echo ""
+            echo "========================================="
+            echo "  PASO 3: ELIMINAR MONITOR TCP"
+            echo "========================================="
+            if monitor_exists "$monitor_name"; then
+                echo "[ELIMINANDO] Monitor $monitor_name..."
+                local r3=$(curl -sk -u "$F5_USER:$F5_PASS" \
+                  -H "Content-Type: application/json" -X DELETE \
+                  "https://$F5_HOST/mgmt/tm/ltm/monitor/tcp/$monitor_name" \
+                  2>&1)
+                if [[ -z "$r3" ]] || ! echo "$r3" | jq -e '.message' \
+                  >/dev/null 2>&1; then
+                    echo "[OK] Monitor eliminado"
+                else
+                    echo "[ERROR] No se pudo eliminar el monitor:"
+                    echo "$r3" | jq -r '.message // .' 2>/dev/null
+                    return 1
+                fi
+            else
+                echo "[INFO] Monitor '$monitor_name' no existe, se omite"
+            fi
+            ;;
+
+        2)
+            [[ -z "$vs_name" ]] && read -p "Nombre del VS a eliminar: " vs_name
+            delete_virtual_server "$vs_name"
+            ;;
+
+        3)
+            [[ -z "$pool_name" ]] && read -p "Nombre del Pool a eliminar: " pool_name
+            delete_pool "$pool_name"
+            ;;
+
+        4)
+            [[ -z "$pool_name" ]] && read -p "Nombre del Pool: " pool_name
+            read -p "Miembro a eliminar (IP:PUERTO): " member
+            delete_member "$pool_name" "$member"
+            ;;
+
+        5)
+            [[ -z "$monitor_name" ]] && read -p "Nombre del Monitor a eliminar: " monitor_name
+            delete_monitor "$monitor_name"
+            ;;
+
+        *)
+            echo "[ERROR] Opción no válida"
+            return 1
+            ;;
+    esac
+
+    echo ""
+    echo "╔════════════════════════════════════════════════════════╗"
+    echo "║           [OK] ELIMINACIÓN COMPLETADA                 ║"
+    echo "╚════════════════════════════════════════════════════════╝"
+}
+
+# ============================================================================
+# FLUJO CREATE
+# ============================================================================
+run_create() {
+    local file="$1"
+    read_dynamic_params
+
+    echo "[VALIDANDO] JSON..."; jq empty "$file" 2>/dev/null || exit 1
+    echo "[OK] JSON válido"
+
+    local vs_name=$(jq -r '.vs_name' "$file")
+    vs_exists "$vs_name" && echo "[ERROR] VS '$vs_name' ya existe" && exit 1
+
+    echo ""; echo "===  PASO 1: MONITOR TCP  ==="
+    local monitor_name=$(create_tcp_monitor | tail -1)
+
+    echo ""; echo "===  PASO 2: POOL  ==="
+    local pool_payload=$(jq -n \
+      --arg name    "$POOL_NAME" \
+      --arg desc    "$(jq -r '.description // ""' "$file")" \
+      --arg lb      "$(jq -r '.pool.lb_method // "least-connections-member"' "$file")" \
+      --arg monitor "/Common/$monitor_name" \
+      --argjson members "$(jq '.pool.members' "$file" | format_members)" \
+      '{name:$name,description:$desc,loadBalancingMode:$lb,
+        monitor:$monitor,members:$members}')
+    local r=$(curl -sk -u "$F5_USER:$F5_PASS" \
+      -H "Content-Type: application/json" -X POST -d "$pool_payload" \
+      "https://$F5_HOST/mgmt/tm/ltm/pool" 2>&1)
+    echo "$r" | jq -e '.name' >/dev/null 2>&1 \
+      && echo "[OK] Pool creado" \
+      || { echo "[ERROR]"; echo "$r" | jq -r '.message//.'; exit 1; }
+
+    echo ""; echo "===  PASO 3: VIRTUAL SERVER  ==="
+    local dest="$(jq -r '.vs.destination' "$file"):$(jq -r '.vs.service_port' "$file")"
+    local vs_payload=$(jq -n \
+      --arg name   "$vs_name" \
+      --arg dest   "$dest" \
+      --arg mask   "$(jq -r '.vs.destination_mask' "$file")" \
+      --arg source "$(jq -r '.vs.source_address // "0.0.0.0/0"' "$file")" \
+      --arg pool   "/Common/$POOL_NAME" \
+      --arg snat   "$(jq -r '.vs.snat // "automap"' "$file")" \
+      '{name:$name,destination:$dest,mask:$mask,source:$source,
+        pool:$pool,sourceAddressTranslation:{type:$snat},
+        ipProtocol:"tcp",profiles:[{name:"/Common/tcp"}]}')
+    [[ -n "$VLAN_NAME" ]] && vs_payload=$(echo "$vs_payload" | \
+      jq --arg v "/Common/$VLAN_NAME" '. + {vlans:[$v],vlansEnabled:true}')
+    local vr=$(curl -sk -u "$F5_USER:$F5_PASS" \
+      -H "Content-Type: application/json" -X POST -d "$vs_payload" \
+      "https://$F5_HOST/mgmt/tm/ltm/virtual" 2>&1)
+    echo "$vr" | jq -e '.name' >/dev/null 2>&1 \
+      && echo "[OK] VS creado" \
+      || { echo "[ERROR]"; echo "$vr" | jq -r '.message//.'; exit 1; }
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+main() {
+    if [[ $# -lt 1 ]]; then
+        echo "Uso:"
+        echo "  ./f5_manager.sh create example.json"
+        echo "  ./f5_manager.sh delete"
+        echo "  ./f5_manager.sh delete example.json"
+        exit 1
+    fi
+
+    local action="$1"
+
+    echo ""
+    echo "╔════════════════════════════════════════════════════════╗"
+    echo "║   F5 Pool & Virtual Server Manager                    ║"
+    echo "╚════════════════════════════════════════════════════════╝"
+
+    read_credentials
+
+    case "$action" in
+        create) run_create "${2:-}" ;;
+        delete) run_delete "$@"     ;;
+        *)
+            echo "[ERROR] Acción no soportada: $action"
+            echo "   Use: create | delete"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
